@@ -2,6 +2,7 @@ import logging
 import os
 import gc
 import glob
+import re
 from pathlib import Path
 
 from trainer import Trainer, TrainerArgs
@@ -11,174 +12,103 @@ from TTS.tts.datasets import load_tts_samples
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig, XttsAudioConfig
 from TTS.utils.manage import ModelManager
 import shutil
-import torch
 
 
-def detect_and_configure_gpus():
+def cleanup_old_checkpoints(output_dir, max_checkpoints=2):
     """
-    Automatically detect available GPUs and configure multi-GPU training.
-    Returns GPU configuration parameters.
+    Limpia checkpoints antiguos, manteniendo solo los max_checkpoints más recientes.
+    Incluye best_model.pth, best_model_*.pth y checkpoint_*.pth
     """
-    if not torch.cuda.is_available():
-        print("CUDA not available. Training will use CPU.")
-        return {
-            'use_cuda': False,
-            'num_gpus': 0,
-            'gpu_ids': [],
-            'distributed': False
-        }
-    
-    num_gpus = torch.cuda.device_count()
-    gpu_ids = list(range(num_gpus))
-    
-    print(f"Detected {num_gpus} GPU(s):")
-    for i in range(num_gpus):
-        gpu_name = torch.cuda.get_device_name(i)
-        gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-        print(f"  GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
-    
-    # Configure for multi-GPU if more than 1 GPU available
-    use_distributed = num_gpus > 1
-    
-    if use_distributed:
-        print(f"Configuring distributed training across {num_gpus} GPUs")
-        # Set environment variables for distributed training
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
-    else:
-        print(f"Using single GPU training on GPU 0")
-    
-    return {
-        'use_cuda': True,
-        'num_gpus': num_gpus,
-        'gpu_ids': gpu_ids,
-        'distributed': use_distributed
-    }
-
-
-def find_latest_checkpoint(output_path):
-    """
-    Find the latest checkpoint in the training directory for resumption.
-    Returns the path to the latest checkpoint or None if no checkpoints found.
-    """
-    # Look for existing training directories
-    run_base_dir = os.path.join(output_path, "run")
-    if not os.path.exists(run_base_dir):
-        return None
-    
-    # Find all training subdirectories
-    training_dirs = []
-    for item in os.listdir(run_base_dir):
-        item_path = os.path.join(run_base_dir, item)
-        if os.path.isdir(item_path) and "training" in item:
-            training_dirs.append(item_path)
-    
-    if not training_dirs:
-        return None
-    
-    # Get the most recent training directory
-    latest_training_dir = max(training_dirs, key=os.path.getmtime)
-    
-    # Find checkpoint files in the latest training directory
-    checkpoint_pattern = os.path.join(latest_training_dir, "checkpoint_*.pth")
-    checkpoint_files = glob.glob(checkpoint_pattern)
-    
-    if not checkpoint_files:
-        return None
-    
-    # Sort by step number (extract number from filename)
-    def extract_step(filename):
-        try:
-            return int(os.path.basename(filename).split('_')[1].split('.')[0])
-        except:
-            return 0
-    
-    checkpoint_files.sort(key=extract_step, reverse=True)
-    latest_checkpoint = checkpoint_files[0]
-    
-    print(f"Found latest checkpoint: {latest_checkpoint}")
-    return latest_checkpoint
-
-
-def cleanup_old_checkpoints(output_path, max_checkpoints=2):
-    """
-    Keep only the most recent checkpoints to save storage space.
-    Keeps the best_model.pth and the most recent checkpoint.
-    """
-    # Find all training directories
-    run_base_dir = os.path.join(output_path, "run")
-    if not os.path.exists(run_base_dir):
-        return
-    
-    training_dirs = []
-    for item in os.listdir(run_base_dir):
-        item_path = os.path.join(run_base_dir, item)
-        if os.path.isdir(item_path):
-            training_dirs.append(item_path)
-    
-    # Clean up checkpoints in each training directory
-    for checkpoint_dir in training_dirs:
-        # Find all checkpoint files (including checkpoint_1000.pth format)
-        checkpoint_pattern = os.path.join(checkpoint_dir, "checkpoint_*.pth")
-        checkpoint_files = glob.glob(checkpoint_pattern)
-        
-        if len(checkpoint_files) <= max_checkpoints:
-            continue
-        
-        # Sort by step number (extract number from filename)
-        def extract_step(filename):
-            try:
-                return int(os.path.basename(filename).split('_')[1].split('.')[0])
-            except:
-                return 0
-        
-        checkpoint_files.sort(key=extract_step, reverse=True)
-        
-        # Keep only the most recent max_checkpoints files
-        files_to_keep = checkpoint_files[:max_checkpoints]
-        files_to_remove = checkpoint_files[max_checkpoints:]
-        
-        # Also keep best_model.pth and best_model_*.pth files
-        best_model_patterns = [
-            os.path.join(checkpoint_dir, "best_model.pth"),
-            os.path.join(checkpoint_dir, "best_model_*.pth")
+    try:
+        output_path = Path(output_dir)
+        if not output_path.exists():
+            return
+            
+        # Patrones de archivos de checkpoint
+        checkpoint_patterns = [
+            'checkpoint_*.pth',
+            'best_model_*.pth'
         ]
         
-        for pattern in best_model_patterns:
-            best_files = glob.glob(pattern)
-            files_to_keep.extend(best_files)
+        all_checkpoints = []
         
-        # Remove old checkpoint files
-        for file_path in files_to_remove:
-            if file_path not in files_to_keep:
+        # Recopilar todos los archivos de checkpoint con su tiempo de modificación
+        for pattern in checkpoint_patterns:
+            for checkpoint_file in output_path.glob(pattern):
+                mtime = checkpoint_file.stat().st_mtime
+                all_checkpoints.append((checkpoint_file, mtime))
+        
+        # Ordenar por tiempo de modificación (más reciente primero)
+        all_checkpoints.sort(key=lambda x: x[1], reverse=True)
+        
+        # Mantener best_model.pth siempre
+        best_model_path = output_path / 'best_model.pth'
+        protected_files = set()
+        if best_model_path.exists():
+            protected_files.add(best_model_path)
+        
+        # Contar archivos a mantener (excluyendo best_model.pth si existe)
+        files_to_keep = []
+        for checkpoint_file, _ in all_checkpoints:
+            if checkpoint_file not in protected_files:
+                files_to_keep.append(checkpoint_file)
+        
+        # Eliminar archivos excedentes
+        if len(files_to_keep) > max_checkpoints:
+            files_to_delete = files_to_keep[max_checkpoints:]
+            for file_to_delete in files_to_delete:
                 try:
-                    os.remove(file_path)
-                    print(f"Removed old checkpoint: {os.path.basename(file_path)}")
-                except Exception as e:
-                    print(f"Error removing {file_path}: {e}")
+                    file_to_delete.unlink()
+                    print(f" > Deleted old checkpoint: {file_to_delete.name}")
+                except OSError as e:
+                    print(f" > Warning: Could not delete {file_to_delete.name}: {e}")
+                    
+    except Exception as e:
+        print(f" > Warning: Error during checkpoint cleanup: {e}")
 
 
-class CheckpointCleanupTrainer(Trainer):
-    """Custom Trainer that automatically cleans up old checkpoints"""
-    
-    def __init__(self, *args, **kwargs):
-        self.output_base_path = kwargs.pop('output_base_path', None)
-        super().__init__(*args, **kwargs)
-    
-    def save_checkpoint(self, *args, **kwargs):
-        # Call the original save_checkpoint method
-        result = super().save_checkpoint(*args, **kwargs)
+def find_latest_checkpoint(output_dir):
+    """
+    Encuentra el checkpoint más reciente para reanudar el entrenamiento.
+    Retorna la ruta del checkpoint y el número de paso si se encuentra.
+    """
+    try:
+        output_path = Path(output_dir)
+        if not output_path.exists():
+            return None, 0
+            
+        # Buscar checkpoints numerados primero
+        checkpoint_files = list(output_path.glob('checkpoint_*.pth'))
         
-        # Clean up old checkpoints after saving
-        if self.output_base_path:
-            cleanup_old_checkpoints(self.output_base_path, max_checkpoints=2)
+        if checkpoint_files:
+            # Extraer números de paso y encontrar el más alto
+            latest_step = 0
+            latest_checkpoint = None
+            
+            for checkpoint_file in checkpoint_files:
+                match = re.search(r'checkpoint_(\d+)\.pth', checkpoint_file.name)
+                if match:
+                    step = int(match.group(1))
+                    if step > latest_step:
+                        latest_step = step
+                        latest_checkpoint = checkpoint_file
+            
+            if latest_checkpoint:
+                return str(latest_checkpoint), latest_step
         
-        return result
+        # Si no hay checkpoints numerados, buscar best_model.pth
+        best_model = output_path / 'best_model.pth'
+        if best_model.exists():
+            return str(best_model), 0
+            
+        return None, 0
+        
+    except Exception as e:
+        print(f" > Warning: Error finding latest checkpoint: {e}")
+        return None, 0
 
 
 def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995):
-    # Detect and configure GPUs automatically
-    gpu_config = detect_and_configure_gpus()
-    
     #  Logging parameters
     RUN_NAME = "GPT_XTTS_FT"
     PROJECT_NAME = "XTTS_trainer"
@@ -189,19 +119,37 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
 
     # Set here the path that the checkpoints will be saved. Default: ./run/training/
     OUT_PATH = os.path.join(output_path, "run", "training")
+    
+    # Verificar si existe un entrenamiento previo para reanudar
+    resume_checkpoint = None
+    resume_step = 0
+    
+    if os.path.exists(OUT_PATH):
+        # Buscar el directorio de entrenamiento más reciente
+        training_dirs = [d for d in os.listdir(OUT_PATH) if os.path.isdir(os.path.join(OUT_PATH, d))]
+        if training_dirs:
+            # Obtener el directorio más reciente
+            latest_dir = max(training_dirs, key=lambda d: os.path.getctime(os.path.join(OUT_PATH, d)))
+            latest_training_path = os.path.join(OUT_PATH, latest_dir)
+            
+            # Buscar checkpoint para reanudar
+            resume_checkpoint, resume_step = find_latest_checkpoint(latest_training_path)
+            
+            if resume_checkpoint:
+                print(f" > Found previous training session: {latest_training_path}")
+                print(f" > Resuming from checkpoint: {resume_checkpoint} (step {resume_step})")
+                
+                # Limpiar checkpoints antiguos
+                print(" > Cleaning up old checkpoints...")
+                cleanup_old_checkpoints(latest_training_path, max_checkpoints=1)
+            else:
+                print(f" > Previous training directory found but no valid checkpoints: {latest_training_path}")
 
-    # Training Parameters - Adjust for multi-GPU
-    OPTIMIZER_WD_ONLY_ON_WEIGHTS = not gpu_config['distributed']  # False for multi-gpu training
+    # Training Parameters
+    OPTIMIZER_WD_ONLY_ON_WEIGHTS = True  # for multi-gpu training please make it False
     START_WITH_EVAL = False  # if True it will star with evaluation
     BATCH_SIZE = batch_size  # set here the batch size
     GRAD_ACUMM_STEPS = grad_acumm  # set here the grad accumulation steps
-    
-    # Adjust batch size for multi-GPU training
-    if gpu_config['distributed'] and gpu_config['num_gpus'] > 1:
-        print(f"Adjusting batch size for {gpu_config['num_gpus']} GPUs")
-        # Keep the same effective batch size by dividing by number of GPUs
-        BATCH_SIZE = max(1, batch_size // gpu_config['num_gpus'])
-        print(f"Per-GPU batch size: {BATCH_SIZE} (total effective: {BATCH_SIZE * gpu_config['num_gpus']})")
 
 
     # Define here the dataset that you want to use for the fine-tuning on.
@@ -284,14 +232,9 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
         else:
             print(" > Error: The specified custom model is not a valid .pth file path.")
 
-    # Adjust num_workers for multi-GPU training
     num_workers = 8
     if language == "ja":
         num_workers = 0
-    elif gpu_config['distributed'] and gpu_config['num_gpus'] > 1:
-        # Increase workers for multi-GPU to keep GPUs fed with data
-        num_workers = min(16, 8 * gpu_config['num_gpus'])
-        print(f"Adjusted num_workers to {num_workers} for multi-GPU training")
     # init args and config
     model_args = GPTArgs(
         max_conditioning_length=132300,  # 6 secs
@@ -333,10 +276,8 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
         plot_step=100,
         log_model_step=100,
         save_step=1000,
-        save_n_checkpoints=2,
+        save_n_checkpoints=1,
         save_checkpoints=True,
-        # Multi-GPU configuration
-        use_cuda=gpu_config['use_cuda'],
         # target_loss="loss",
         print_eval=False,
         # Optimizer values like tortoise, pytorch implementation with modifications to not apply WD to non-weight parameters.
@@ -361,49 +302,25 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
         eval_split_size=config.eval_split_size,
     )
 
-    # Check for existing checkpoints to resume training
-    latest_checkpoint = find_latest_checkpoint(output_path)
-    restore_path = None
-    
-    if latest_checkpoint:
-        print(f"🔄 Resuming training from checkpoint: {os.path.basename(latest_checkpoint)}")
-        restore_path = latest_checkpoint
-        
-        # Extract step number from checkpoint filename for progress tracking
-        try:
-            step_num = int(os.path.basename(latest_checkpoint).split('_')[1].split('.')[0])
-            print(f"📊 Resuming from step: {step_num}")
-        except:
-            print("⚠️ Could not extract step number from checkpoint filename")
-    else:
-        print("🆕 Starting fresh training - no existing checkpoints found")
-    
-    # Configure trainer arguments for multi-GPU
-    trainer_args = TrainerArgs(
-        restore_path=restore_path,  # Use found checkpoint for resumption
-        skip_train_epoch=False,
-        start_with_eval=START_WITH_EVAL,
-        grad_accum_steps=GRAD_ACUMM_STEPS,
-    )
-    
-    # Add distributed training configuration if multiple GPUs
-    if gpu_config['distributed']:
-        trainer_args.use_ddp = True
-        trainer_args.rank = 0  # Will be set by DDP launcher
-        trainer_args.group_id = "group_id"
-        print("Configured for Distributed Data Parallel (DDP) training")
-    
     # init the trainer and 🚀
-    trainer = CheckpointCleanupTrainer(
-        trainer_args,
+    trainer = Trainer(
+        TrainerArgs(
+            restore_path=resume_checkpoint,  # Use found checkpoint for resuming training
+            skip_train_epoch=False,
+            start_with_eval=START_WITH_EVAL,
+            grad_accum_steps=GRAD_ACUMM_STEPS,
+        ),
         config,
         output_path=OUT_PATH,
         model=model,
         train_samples=train_samples,
         eval_samples=eval_samples,
-        output_base_path=output_path,
     )
     trainer.fit()
+
+    # Limpiar checkpoints al final del entrenamiento
+    print(" > Final checkpoint cleanup...")
+    cleanup_old_checkpoints(trainer.output_path, max_checkpoints=1)
 
     # get the longest text audio file to use as speaker reference
     samples_len = [len(item["text"].split(" ")) for item in train_samples]

@@ -415,9 +415,28 @@ if __name__ == "__main__":
             
                 run_dir = Path(output_path) / "run"
             
-                # Remove train dir
+                # Check for existing training to potentially resume
+                can_resume_training = False
                 if run_dir.exists():
+                    # Check if there are any training directories that could be resumed
+                    training_path = run_dir / "training"
+                    if training_path.exists():
+                        training_dirs = [d for d in training_path.iterdir() if d.is_dir()]
+                        if training_dirs:
+                            # Check if any contains checkpoints
+                            for train_dir in training_dirs:
+                                checkpoints = list(train_dir.glob("*.pth"))
+                                if checkpoints:
+                                    can_resume_training = True
+                                    print(f"Found existing training session that can be resumed in: {train_dir}")
+                                    break
+                
+                # Only remove run dir if we can't resume training
+                if run_dir.exists() and not can_resume_training:
+                    print("Removing previous incomplete training directory...")
                     shutil.rmtree(run_dir)
+                elif can_resume_training:
+                    print("Preserving existing training directory for potential resume...")
                 
                 # Check if the dataset language matches the language you specified 
                 lang_file_path = Path(output_path) / "dataset" / "lang.txt"
