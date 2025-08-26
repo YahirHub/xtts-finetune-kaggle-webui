@@ -2,7 +2,6 @@ import logging
 import os
 import gc
 import glob
-import re
 from pathlib import Path
 
 from trainer import Trainer, TrainerArgs
@@ -14,99 +13,42 @@ from TTS.utils.manage import ModelManager
 import shutil
 
 
-def cleanup_old_checkpoints(output_dir, max_checkpoints=2):
+def cleanup_old_checkpoints(training_path, max_checkpoints=1):
     """
-    Limpia checkpoints antiguos, manteniendo solo los max_checkpoints más recientes.
-    Incluye best_model.pth, best_model_*.pth y checkpoint_*.pth
+    Limpia checkpoints antiguos, manteniendo solo los más recientes.
+    Mantiene solo max_checkpoints de cada tipo (checkpoint_*.pth y best_model*.pth)
     """
     try:
-        output_path = Path(output_dir)
-        if not output_path.exists():
-            return
-            
-        # Patrones de archivos de checkpoint
-        checkpoint_patterns = [
-            'checkpoint_*.pth',
-            'best_model_*.pth'
-        ]
-        
-        all_checkpoints = []
-        
-        # Recopilar todos los archivos de checkpoint con su tiempo de modificación
-        for pattern in checkpoint_patterns:
-            for checkpoint_file in output_path.glob(pattern):
-                mtime = checkpoint_file.stat().st_mtime
-                all_checkpoints.append((checkpoint_file, mtime))
-        
-        # Ordenar por tiempo de modificación (más reciente primero)
-        all_checkpoints.sort(key=lambda x: x[1], reverse=True)
-        
-        # Mantener best_model.pth siempre
-        best_model_path = output_path / 'best_model.pth'
-        protected_files = set()
-        if best_model_path.exists():
-            protected_files.add(best_model_path)
-        
-        # Contar archivos a mantener (excluyendo best_model.pth si existe)
-        files_to_keep = []
-        for checkpoint_file, _ in all_checkpoints:
-            if checkpoint_file not in protected_files:
-                files_to_keep.append(checkpoint_file)
-        
-        # Eliminar archivos excedentes
-        if len(files_to_keep) > max_checkpoints:
-            files_to_delete = files_to_keep[max_checkpoints:]
-            for file_to_delete in files_to_delete:
+        # Limpiar checkpoints regulares (checkpoint_*.pth)
+        checkpoint_pattern = os.path.join(training_path, "checkpoint_*.pth")
+        checkpoint_files = glob.glob(checkpoint_pattern)
+        if len(checkpoint_files) > max_checkpoints:
+            # Ordenar por tiempo de modificación (más reciente primero)
+            checkpoint_files.sort(key=os.path.getmtime, reverse=True)
+            # Eliminar archivos antiguos
+            for old_checkpoint in checkpoint_files[max_checkpoints:]:
                 try:
-                    file_to_delete.unlink()
-                    print(f" > Deleted old checkpoint: {file_to_delete.name}")
-                except OSError as e:
-                    print(f" > Warning: Could not delete {file_to_delete.name}: {e}")
+                    os.remove(old_checkpoint)
+                    print(f"Eliminado checkpoint antiguo: {old_checkpoint}")
+                except Exception as e:
+                    print(f"Error al eliminar {old_checkpoint}: {e}")
+        
+        # Limpiar best_model checkpoints (best_model*.pth, excepto best_model.pth)
+        best_model_pattern = os.path.join(training_path, "best_model_*.pth")
+        best_model_files = glob.glob(best_model_pattern)
+        if len(best_model_files) > max_checkpoints:
+            # Ordenar por tiempo de modificación (más reciente primero)
+            best_model_files.sort(key=os.path.getmtime, reverse=True)
+            # Eliminar archivos antiguos
+            for old_best_model in best_model_files[max_checkpoints:]:
+                try:
+                    os.remove(old_best_model)
+                    print(f"Eliminado best_model antiguo: {old_best_model}")
+                except Exception as e:
+                    print(f"Error al eliminar {old_best_model}: {e}")
                     
     except Exception as e:
-        print(f" > Warning: Error during checkpoint cleanup: {e}")
-
-
-def find_latest_checkpoint(output_dir):
-    """
-    Encuentra el checkpoint más reciente para reanudar el entrenamiento.
-    Retorna la ruta del checkpoint y el número de paso si se encuentra.
-    """
-    try:
-        output_path = Path(output_dir)
-        if not output_path.exists():
-            return None, 0
-            
-        # Buscar checkpoints numerados primero
-        checkpoint_files = list(output_path.glob('checkpoint_*.pth'))
-        
-        if checkpoint_files:
-            # Extraer números de paso y encontrar el más alto
-            latest_step = 0
-            latest_checkpoint = None
-            
-            for checkpoint_file in checkpoint_files:
-                match = re.search(r'checkpoint_(\d+)\.pth', checkpoint_file.name)
-                if match:
-                    step = int(match.group(1))
-                    if step > latest_step:
-                        latest_step = step
-                        latest_checkpoint = checkpoint_file
-            
-            if latest_checkpoint:
-                return str(latest_checkpoint), latest_step
-        
-        # Si no hay checkpoints numerados, buscar best_model.pth
-        best_model = output_path / 'best_model.pth'
-        if best_model.exists():
-            return str(best_model), 0
-            
-        return None, 0
-        
-    except Exception as e:
-        print(f" > Warning: Error finding latest checkpoint: {e}")
-        return None, 0
-
+        print(f"Error durante la limpieza de checkpoints: {e}")
 
 def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995):
     #  Logging parameters
@@ -119,31 +61,6 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
 
     # Set here the path that the checkpoints will be saved. Default: ./run/training/
     OUT_PATH = os.path.join(output_path, "run", "training")
-    
-    # Verificar si existe un entrenamiento previo para reanudar
-    resume_checkpoint = None
-    resume_step = 0
-    
-    if os.path.exists(OUT_PATH):
-        # Buscar el directorio de entrenamiento más reciente
-        training_dirs = [d for d in os.listdir(OUT_PATH) if os.path.isdir(os.path.join(OUT_PATH, d))]
-        if training_dirs:
-            # Obtener el directorio más reciente
-            latest_dir = max(training_dirs, key=lambda d: os.path.getctime(os.path.join(OUT_PATH, d)))
-            latest_training_path = os.path.join(OUT_PATH, latest_dir)
-            
-            # Buscar checkpoint para reanudar
-            resume_checkpoint, resume_step = find_latest_checkpoint(latest_training_path)
-            
-            if resume_checkpoint:
-                print(f" > Found previous training session: {latest_training_path}")
-                print(f" > Resuming from checkpoint: {resume_checkpoint} (step {resume_step})")
-                
-                # Limpiar checkpoints antiguos
-                print(" > Cleaning up old checkpoints...")
-                cleanup_old_checkpoints(latest_training_path, max_checkpoints=1)
-            else:
-                print(f" > Previous training directory found but no valid checkpoints: {latest_training_path}")
 
     # Training Parameters
     OPTIMIZER_WD_ONLY_ON_WEIGHTS = True  # for multi-gpu training please make it False
@@ -305,7 +222,7 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
     # init the trainer and 🚀
     trainer = Trainer(
         TrainerArgs(
-            restore_path=resume_checkpoint,  # Use found checkpoint for resuming training
+            restore_path=None,  # xtts checkpoint is restored via xtts_checkpoint key so no need of restore it using Trainer restore_path parameter
             skip_train_epoch=False,
             start_with_eval=START_WITH_EVAL,
             grad_accum_steps=GRAD_ACUMM_STEPS,
@@ -316,11 +233,24 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
         train_samples=train_samples,
         eval_samples=eval_samples,
     )
+    
+    # Crear una función de callback personalizada para limpiar checkpoints
+    original_save_checkpoint = trainer.save_checkpoint
+    
+    def save_checkpoint_with_cleanup(*args, **kwargs):
+        # Llamar al método original de guardar checkpoint
+        result = original_save_checkpoint(*args, **kwargs)
+        # Limpiar checkpoints antiguos después de guardar
+        cleanup_old_checkpoints(OUT_PATH, max_checkpoints=1)
+        return result
+    
+    # Reemplazar el método de guardar checkpoint con nuestra versión personalizada
+    trainer.save_checkpoint = save_checkpoint_with_cleanup
+    
     trainer.fit()
 
-    # Limpiar checkpoints al final del entrenamiento
-    print(" > Final checkpoint cleanup...")
-    cleanup_old_checkpoints(trainer.output_path, max_checkpoints=1)
+    # Limpieza final de checkpoints después del entrenamiento
+    cleanup_old_checkpoints(OUT_PATH, max_checkpoints=1)
 
     # get the longest text audio file to use as speaker reference
     samples_len = [len(item["text"].split(" ")) for item in train_samples]
