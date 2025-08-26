@@ -27,6 +27,7 @@ import requests
 import zipfile
 import subprocess
 from huggingface_hub import snapshot_download, HfApi, HfFolder
+import gdown
 
 def download_file(url, destination):
     try:
@@ -153,6 +154,101 @@ def clear_gpu_cache():
     # Limpiar la caché de la GPU
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+def extract_zip_audios(zip_files, temp_folder="temp_audio_extraction"):
+    """
+    Extrae archivos de audio de archivos ZIP a una carpeta temporal
+    """
+    if not zip_files:
+        return "No se seleccionaron archivos ZIP.", ""
+    
+    try:
+        # Crear carpeta temporal
+        temp_path = os.path.join(tempfile.gettempdir(), temp_folder)
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path)
+        os.makedirs(temp_path, exist_ok=True)
+        
+        extracted_count = 0
+        supported_formats = ['.wav', '.mp3', '.flac', '.m4a', '.ogg']
+        
+        for zip_file in zip_files:
+            if zipfile.is_zipfile(zip_file.name):
+                with zipfile.ZipFile(zip_file.name, 'r') as zip_ref:
+                    for file_info in zip_ref.infolist():
+                        # Solo extraer archivos de audio
+                        if any(file_info.filename.lower().endswith(ext) for ext in supported_formats):
+                            # Evitar problemas con nombres de archivos
+                            safe_filename = os.path.basename(file_info.filename)
+                            if safe_filename:  # Evitar carpetas vacías
+                                extract_path = os.path.join(temp_path, safe_filename)
+                                with zip_ref.open(file_info) as source, open(extract_path, 'wb') as target:
+                                    shutil.copyfileobj(source, target)
+                                extracted_count += 1
+        
+        if extracted_count > 0:
+            return f"✅ Extraídos {extracted_count} archivos de audio a carpeta temporal", temp_path
+        else:
+            return "❌ No se encontraron archivos de audio en los ZIP seleccionados", ""
+            
+    except Exception as e:
+        return f"❌ Error al extraer archivos ZIP: {str(e)}", ""
+
+def download_from_google_drive(gdrive_url, temp_folder="temp_gdrive_download"):
+    """
+    Descarga un archivo ZIP desde Google Drive usando gdown y lo extrae
+    """
+    if not gdrive_url:
+        return "No se proporcionó URL de Google Drive.", ""
+    
+    try:
+        # Crear carpeta temporal para descarga
+        temp_path = os.path.join(tempfile.gettempdir(), temp_folder)
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path)
+        os.makedirs(temp_path, exist_ok=True)
+        
+        # Nombre del archivo descargado
+        downloaded_file = os.path.join(temp_path, "gdrive_download.zip")
+        
+        # Descargar usando gdown
+        try:
+            gdown.download(gdrive_url, downloaded_file, quiet=False, fuzzy=True)
+        except Exception as e:
+            return f"❌ Error al descargar desde Google Drive: {str(e)}", ""
+        
+        if not os.path.exists(downloaded_file):
+            return "❌ No se pudo descargar el archivo desde Google Drive", ""
+        
+        # Si es un ZIP, extraer los audios
+        if zipfile.is_zipfile(downloaded_file):
+            extracted_count = 0
+            supported_formats = ['.wav', '.mp3', '.flac', '.m4a', '.ogg']
+            
+            with zipfile.ZipFile(downloaded_file, 'r') as zip_ref:
+                for file_info in zip_ref.infolist():
+                    # Solo extraer archivos de audio
+                    if any(file_info.filename.lower().endswith(ext) for ext in supported_formats):
+                        # Evitar problemas con nombres de archivos
+                        safe_filename = os.path.basename(file_info.filename)
+                        if safe_filename:  # Evitar carpetas vacías
+                            extract_path = os.path.join(temp_path, safe_filename)
+                            with zip_ref.open(file_info) as source, open(extract_path, 'wb') as target:
+                                shutil.copyfileobj(source, target)
+                            extracted_count += 1
+            
+            # Eliminar el archivo ZIP después de extraer
+            os.remove(downloaded_file)
+            
+            if extracted_count > 0:
+                return f"✅ Descargado y extraídos {extracted_count} archivos de audio desde Google Drive", temp_path
+            else:
+                return "❌ No se encontraron archivos de audio en el ZIP de Google Drive", ""
+        else:
+            return "❌ El archivo descargado no es un ZIP válido", ""
+            
+    except Exception as e:
+        return f"❌ Error al procesar descarga de Google Drive: {str(e)}", ""
 
 XTTS_MODEL = None
 
@@ -383,6 +479,37 @@ if __name__ == "__main__":
                 file_count="multiple",
                 label="Selecciona aquí los archivos de audio que quieres usar para el entrenamiento de XTTS (Formatos soportados: wav, mp3, y flac)",
             )
+            
+            # Nueva opción para cargar archivos ZIP con audios
+            with gr.Row():
+                with gr.Column():
+                    zip_upload = gr.File(
+                        file_count="multiple",
+                        label="O sube archivos ZIP con audios (se extraerán automáticamente):",
+                        file_types=[".zip"]
+                    )
+                    extract_btn = gr.Button("Extraer audios de ZIP", variant="secondary")
+                with gr.Column():
+                    extraction_status = gr.Textbox(
+                        label="Estado de extracción:",
+                        interactive=False,
+                        placeholder="Selecciona archivos ZIP y presiona 'Extraer audios de ZIP'"
+                    )
+            
+            # Nueva opción para descargar desde Google Drive
+            with gr.Row():
+                with gr.Column():
+                    gdrive_url = gr.Textbox(
+                        label="O introduce URL de Google Drive (ZIP con audios):",
+                        placeholder="https://drive.google.com/file/d/1ABC123.../view?usp=sharing"
+                    )
+                    gdrive_download_btn = gr.Button("Descargar desde Google Drive", variant="secondary")
+                with gr.Column():
+                    gdrive_status = gr.Textbox(
+                        label="Estado de descarga:",
+                        interactive=False,
+                        placeholder="Introduce URL de Google Drive y presiona 'Descargar desde Google Drive'"
+                    )
             
             audio_folder_path = gr.Textbox(
                 label="Ruta a la carpeta con archivos de audio (opcional):",
@@ -718,76 +845,96 @@ if __name__ == "__main__":
                 shell_command = gr.Textbox(label="Comando", placeholder="ls -l ./finetune_models")
                 shell_run_btn = gr.Button("Ejecutar comando")
                 shell_output = gr.Textbox(label="Salida del Comando", lines=10, interactive=False)
+                shell_run_btn.click(fn=execute_shell_command, inputs=[shell_command], outputs=[shell_output])
 
+        # --- Conexiones para la nueva pestaña ---
+        direct_btn.click(fn=download_direct_link, inputs=[direct_url, direct_dest], outputs=[direct_status])
+        upload_btn.click(fn=handle_uploads, inputs=[upload_files_utility, upload_dest], outputs=[upload_status])
+        hf_btn_down.click(fn=download_huggingface_repo, inputs=[hf_repo_down, hf_dest_down, hf_token], outputs=[hf_status_down])
+        hf_btn_up.click(fn=upload_to_huggingface, inputs=[hf_folder_up, hf_repo_up, hf_token, hf_create_repo, hf_is_private], outputs=[hf_status_up])
+        
+        # Función para manejar la extracción de ZIP
+        def handle_zip_extraction(zip_files):
+            status, extracted_path = extract_zip_audios(zip_files)
+            return status, extracted_path
+        
+        extract_btn.click(
+            fn=handle_zip_extraction,
+            inputs=[zip_upload],
+            outputs=[extraction_status, audio_folder_path]
+        )
+        
+        # Función para manejar la descarga de Google Drive
+        def handle_gdrive_download(gdrive_url):
+            status, extracted_path = download_from_google_drive(gdrive_url)
+            return status, extracted_path
+        
+        gdrive_download_btn.click(
+            fn=handle_gdrive_download,
+            inputs=[gdrive_url],
+            outputs=[gdrive_status, audio_folder_path]
+        )
 
-            # --- Conexiones para la nueva pestaña ---
-            direct_btn.click(fn=download_direct_link, inputs=[direct_url, direct_dest], outputs=[direct_status])
-            upload_btn.click(fn=handle_uploads, inputs=[upload_files_utility, upload_dest], outputs=[upload_status])
-            hf_btn_down.click(fn=download_huggingface_repo, inputs=[hf_repo_down, hf_dest_down, hf_token], outputs=[hf_status_down])
-            hf_btn_up.click(fn=upload_to_huggingface, inputs=[hf_folder_up, hf_repo_up, hf_token, hf_create_repo, hf_is_private], outputs=[hf_status_up])
-            shell_run_btn.click(fn=execute_shell_command, inputs=[shell_command], outputs=[shell_output])
+        load_params_btn.click(
+            fn=load_params,
+            inputs=[out_path],
+            outputs=[progress_data, train_csv, eval_csv, lang],
+        )
+
+        prompt_compute_btn.click(
+            fn=preprocess_dataset,
+            inputs=[upload_file, audio_folder_path, lang, whisper_model, out_path, train_csv, eval_csv],
+            outputs=[progress_data, train_csv, eval_csv],
+        )
+
+        train_btn.click(
+            fn=train_model,
+            inputs=[custom_model, version, lang, train_csv, eval_csv, num_epochs, batch_size, grad_acumm, out_path, max_audio_length],
+            outputs=[progress_train, xtts_config, xtts_vocab, xtts_checkpoint,xtts_speaker, speaker_reference_audio],
+        )
+
+        optimize_model_btn.click(
+            fn=optimize_model,
+            inputs=[out_path, clear_train_data],
+            outputs=[progress_train,xtts_checkpoint],
+        )
             
-            # --- Conexiones existentes (sin cambios) ---
-            prompt_compute_btn.click(
-                fn=preprocess_dataset,
-                inputs=[upload_file, audio_folder_path, lang, whisper_model, out_path, train_csv, eval_csv],
-                outputs=[progress_data, train_csv, eval_csv],
-            )
+        load_btn.click(
+            fn=load_model,
+            inputs=[xtts_checkpoint, xtts_config, xtts_vocab, xtts_speaker],
+            outputs=[progress_load],
+        )
 
-            load_params_btn.click(
-                fn=load_params,
-                inputs=[out_path],
-                outputs=[progress_train, train_csv, eval_csv, lang]
-            )
+        tts_btn.click(
+            fn=run_tts,
+            inputs=[tts_language, tts_text, speaker_reference_audio, temperature, length_penalty, repetition_penalty, top_k, top_p, sentence_split, use_config],
+            outputs=[progress_gen, tts_output_audio,reference_audio],
+        )
 
-            train_btn.click(
-                fn=train_model,
-                inputs=[custom_model, version, lang, train_csv, eval_csv, num_epochs, batch_size, grad_acumm, out_path, max_audio_length],
-                outputs=[progress_train, xtts_config, xtts_vocab, xtts_checkpoint,xtts_speaker, speaker_reference_audio],
-            )
-
-            optimize_model_btn.click(
-                fn=optimize_model,
-                inputs=[out_path, clear_train_data],
-                outputs=[progress_train,xtts_checkpoint],
-            )
-            
-            load_btn.click(
-                fn=load_model,
-                inputs=[xtts_checkpoint, xtts_config, xtts_vocab, xtts_speaker],
-                outputs=[progress_load],
-            )
-
-            tts_btn.click(
-                fn=run_tts,
-                inputs=[tts_language, tts_text, speaker_reference_audio, temperature, length_penalty, repetition_penalty, top_k, top_p, sentence_split, use_config],
-                outputs=[progress_gen, tts_output_audio,reference_audio],
-            )
-
-            load_params_tts_btn.click(
-                fn=load_params_tts,
-                inputs=[out_path, version],
-                outputs=[progress_load,xtts_checkpoint,xtts_config,xtts_vocab,xtts_speaker,speaker_reference_audio],
-            )
-            
-            # NUEVA CONEXIÓN para el botón de carga desde ruta personalizada
-            load_from_custom_path_btn.click(
-                fn=load_params_from_custom_path,
-                inputs=[custom_model_path_input],
-                outputs=[progress_load, xtts_checkpoint, xtts_config, xtts_vocab, xtts_speaker, speaker_reference_audio]
-            )
-             
-            model_download_btn.click(
-                fn=get_model_zip,
-                inputs=[out_path],
-                outputs=[model_zip_file]
-            )
-            
-            dataset_download_btn.click(
-                fn=get_dataset_zip,
-                inputs=[out_path],
-                outputs=[dataset_zip_file]
-            )
+        load_params_tts_btn.click(
+            fn=load_params_tts,
+            inputs=[out_path, version],
+            outputs=[progress_load,xtts_checkpoint,xtts_config,xtts_vocab,xtts_speaker,speaker_reference_audio],
+        )
+        
+        # NUEVA CONEXIÓN para el botón de carga desde ruta personalizada
+        load_from_custom_path_btn.click(
+            fn=load_params_from_custom_path,
+            inputs=[custom_model_path_input],
+            outputs=[progress_load, xtts_checkpoint, xtts_config, xtts_vocab, xtts_speaker, speaker_reference_audio]
+        )
+         
+        model_download_btn.click(
+            fn=get_model_zip,
+            inputs=[out_path],
+            outputs=[model_zip_file]
+        )
+        
+        dataset_download_btn.click(
+            fn=get_dataset_zip,
+            inputs=[out_path],
+            outputs=[dataset_zip_file]
+        )
 
     demo.launch(
         share=args.share,
