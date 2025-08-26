@@ -19,36 +19,61 @@ def cleanup_old_checkpoints(training_path, max_checkpoints=1):
     Mantiene solo max_checkpoints de cada tipo (checkpoint_*.pth y best_model*.pth)
     """
     try:
+        print(f"🧹 Iniciando limpieza de checkpoints en: {training_path}")
+        
+        # Buscar en todas las subcarpetas de entrenamiento
+        search_patterns = [
+            os.path.join(training_path, "**", "checkpoint_*.pth"),
+            os.path.join(training_path, "**", "best_model_*.pth")
+        ]
+        
         # Limpiar checkpoints regulares (checkpoint_*.pth)
-        checkpoint_pattern = os.path.join(training_path, "checkpoint_*.pth")
-        checkpoint_files = glob.glob(checkpoint_pattern)
+        checkpoint_files = []
+        for pattern in [os.path.join(training_path, "**", "checkpoint_*.pth")]:
+            checkpoint_files.extend(glob.glob(pattern, recursive=True))
+        
+        print(f"📁 Encontrados {len(checkpoint_files)} checkpoints regulares")
+        
         if len(checkpoint_files) > max_checkpoints:
             # Ordenar por tiempo de modificación (más reciente primero)
             checkpoint_files.sort(key=os.path.getmtime, reverse=True)
             # Eliminar archivos antiguos
             for old_checkpoint in checkpoint_files[max_checkpoints:]:
                 try:
+                    file_size = os.path.getsize(old_checkpoint) / (1024*1024)  # MB
                     os.remove(old_checkpoint)
-                    print(f"Eliminado checkpoint antiguo: {old_checkpoint}")
+                    print(f"🗑️ Eliminado checkpoint antiguo: {os.path.basename(old_checkpoint)} ({file_size:.1f}MB)")
                 except Exception as e:
-                    print(f"Error al eliminar {old_checkpoint}: {e}")
+                    print(f"❌ Error al eliminar {old_checkpoint}: {e}")
         
-        # Limpiar best_model checkpoints (best_model*.pth, excepto best_model.pth)
-        best_model_pattern = os.path.join(training_path, "best_model_*.pth")
-        best_model_files = glob.glob(best_model_pattern)
+        # Limpiar best_model checkpoints (best_model_*.pth, excepto best_model.pth)
+        best_model_files = []
+        for pattern in [os.path.join(training_path, "**", "best_model_*.pth")]:
+            best_model_files.extend(glob.glob(pattern, recursive=True))
+            
+        print(f"📁 Encontrados {len(best_model_files)} best_model checkpoints numerados")
+        
         if len(best_model_files) > max_checkpoints:
             # Ordenar por tiempo de modificación (más reciente primero)
             best_model_files.sort(key=os.path.getmtime, reverse=True)
             # Eliminar archivos antiguos
             for old_best_model in best_model_files[max_checkpoints:]:
                 try:
+                    file_size = os.path.getsize(old_best_model) / (1024*1024)  # MB
                     os.remove(old_best_model)
-                    print(f"Eliminado best_model antiguo: {old_best_model}")
+                    print(f"🗑️ Eliminado best_model antiguo: {os.path.basename(old_best_model)} ({file_size:.1f}MB)")
                 except Exception as e:
-                    print(f"Error al eliminar {old_best_model}: {e}")
+                    print(f"❌ Error al eliminar {old_best_model}: {e}")
+        
+        # Mostrar archivos restantes
+        remaining_files = []
+        for pattern in [os.path.join(training_path, "**", "*.pth")]:
+            remaining_files.extend(glob.glob(pattern, recursive=True))
+        if remaining_files:
+            print(f"📋 Archivos .pth restantes: {[os.path.basename(f) for f in remaining_files]}")
                     
     except Exception as e:
-        print(f"Error durante la limpieza de checkpoints: {e}")
+        print(f"❌ Error durante la limpieza de checkpoints: {e}")
 
 def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995):
     #  Logging parameters
@@ -234,18 +259,31 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
         eval_samples=eval_samples,
     )
     
-    # Crear una función de callback personalizada para limpiar checkpoints
+    # Crear funciones de callback personalizadas para limpiar checkpoints
     original_save_checkpoint = trainer.save_checkpoint
+    original_save_best_model = trainer.save_best_model
     
     def save_checkpoint_with_cleanup(*args, **kwargs):
+        # Limpiar checkpoints antiguos ANTES de guardar el nuevo
+        cleanup_old_checkpoints(OUT_PATH, max_checkpoints=0)  # Eliminar todos los checkpoints antiguos
         # Llamar al método original de guardar checkpoint
         result = original_save_checkpoint(*args, **kwargs)
-        # Limpiar checkpoints antiguos después de guardar
-        cleanup_old_checkpoints(OUT_PATH, max_checkpoints=1)
         return result
     
-    # Reemplazar el método de guardar checkpoint con nuestra versión personalizada
+    def save_best_model_with_cleanup(*args, **kwargs):
+        # Limpiar checkpoints antiguos ANTES de guardar el nuevo
+        cleanup_old_checkpoints(OUT_PATH, max_checkpoints=0)  # Eliminar todos los best_model antiguos
+        # Llamar al método original de guardar best model
+        result = original_save_best_model(*args, **kwargs)
+        return result
+    
+    # Limpiar checkpoints existentes antes de iniciar el entrenamiento
+    print("🧹 Limpiando checkpoints existentes antes de iniciar el entrenamiento...")
+    cleanup_old_checkpoints(OUT_PATH, max_checkpoints=0)
+    
+    # Reemplazar los métodos de guardar con nuestras versiones personalizadas
     trainer.save_checkpoint = save_checkpoint_with_cleanup
+    trainer.save_best_model = save_best_model_with_cleanup
     
     trainer.fit()
 
@@ -254,7 +292,7 @@ def train_gpt(custom_model,version, language, num_epochs, batch_size, grad_acumm
 
     # get the longest text audio file to use as speaker reference
     samples_len = [len(item["text"].split(" ")) for item in train_samples]
-    longest_text_idx =  samples_len.index(max(samples_len))
+    longest_text_idx = samples_len.index(max(samples_len))
     speaker_ref = train_samples[longest_text_idx]["audio_file"]
 
     trainer_out_path = trainer.output_path
